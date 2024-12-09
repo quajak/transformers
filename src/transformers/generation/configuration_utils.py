@@ -93,6 +93,7 @@ class GenerationMode(ExplicitEnum):
     BEAM_SAMPLE = "beam_sample"
     CONSTRAINED_BEAM_SEARCH = "constrained_beam_search"
     GROUP_BEAM_SEARCH = "group_beam_search"
+    CHAIN_OF_THOUGHT = "chain_of_thought"
 
 
 class GenerationConfig(PushToHubMixin):
@@ -536,6 +537,8 @@ class GenerationConfig(PushToHubMixin):
         """
         # TODO joao: find out a way of not depending on external fields (e.g. `assistant_model`), then make this a
         # property and part of the `__repr__`
+        if hasattr(self, "generation_mode"):
+            return self.generation_mode
         if self.constraints is not None or self.force_words_ids is not None:
             generation_mode = GenerationMode.CONSTRAINED_BEAM_SEARCH
         elif self.num_beams == 1:

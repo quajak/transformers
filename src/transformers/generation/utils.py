@@ -150,7 +150,7 @@ class GenerateDecoderOnlyOutput(ModelOutput):
     attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     past_key_values: Optional[Tuple[Tuple[Tuple[torch.FloatTensor]]]] = None
-
+    advantages: Optional[Tuple[torch.FloatTensor]] = None
 
 @dataclass
 class GenerateEncoderDecoderOutput(ModelOutput):
@@ -1384,6 +1384,9 @@ class GenerationMixin:
             if value is not None and key not in model_args:
                 unused_model_args.append(key)
 
+        if 'generation_mode' in unused_model_args:
+            unused_model_args.remove('generation_mode')
+
         if unused_model_args:
             raise ValueError(
                 f"The following `model_kwargs` are not used by the model: {unused_model_args} (note: typos in the"
@@ -2124,7 +2127,8 @@ class GenerationMixin:
         )
 
         # 8. determine generation mode
-        generation_mode = generation_config.get_generation_mode(assistant_model)
+        if not (generation_mode := kwargs.get("generation_mode", None)):
+            generation_mode = generation_config.get_generation_mode(assistant_model)
 
         if streamer is not None and (generation_config.num_beams > 1):
             raise ValueError(
@@ -2259,7 +2263,21 @@ class GenerationMixin:
                 streamer=streamer,
                 **model_kwargs,
             )
+        elif generation_mode == GenerationMode.CHAIN_OF_THOUGHT:
+            # first we need to do top-k on the first token 
+            # then we do greedy search for the next tokens for each of the chains 
+            # then we determine the answer in each of the chains by looking for the certain tokens 
+            # then we calcualte that tokens certainty and use it to select the best chain to return
 
+            result = self._chain_of_thought(
+                input_ids,
+                logits_processor=prepared_logits_processor,
+                stopping_criteria=prepared_stopping_criteria,
+                generation_config=generation_config,
+                synced_gpus=synced_gpus,
+                streamer=streamer,
+                **model_kwargs,
+            )
         elif generation_mode in (GenerationMode.BEAM_SAMPLE, GenerationMode.BEAM_SEARCH):
             # 11. prepare beam search scorer
             beam_scorer = BeamSearchScorer(
@@ -3156,6 +3174,205 @@ class GenerationMixin:
                 )
         else:
             return input_ids
+
+    def _chain_of_thought(
+        self,
+        input_ids: torch.LongTensor,
+        logits_processor: LogitsProcessorList,
+        stopping_criteria: StoppingCriteriaList,
+        generation_config: GenerationConfig,
+        synced_gpus: bool,
+        streamer: Optional["BaseStreamer"],
+        **model_kwargs,
+    ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
+        # first we need to do top-k on the first token 
+        # then we do greedy search for the next tokens for each of the chains 
+        # then we determine the answer in each of the chains by looking for the certain tokens 
+        # then we calcualte that tokens certainty and use it to select the best chain to return
+        
+        # init values
+        pad_token_id = generation_config._pad_token_tensor
+        output_attentions = generation_config.output_attentions
+        output_hidden_states = generation_config.output_hidden_states
+        output_scores = generation_config.output_scores
+        output_logits = generation_config.output_logits
+        return_dict_in_generate = generation_config.return_dict_in_generate
+        max_length = generation_config.max_length
+        has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
+        do_sample = generation_config.do_sample
+
+        # init attention / hidden states / scores tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        raw_logits = () if (return_dict_in_generate and output_logits) else None
+        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
+        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
+        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+
+        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
+        if return_dict_in_generate and self.config.is_encoder_decoder:
+            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            encoder_hidden_states = (
+                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+            )
+
+        # keep track of which sequences are already finished
+        batch_size, cur_len = input_ids.shape
+        this_peer_finished = False
+        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+        model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+
+        model_forward = self.__call__
+        if isinstance(model_kwargs.get("past_key_values"), StaticCache):
+            if self.device.type == "cuda":
+                logger.warning_once("Using `torch.compile`.")
+                os.environ["TOKENIZERS_PARALLELISM"] = "0"
+                model_forward = self.get_compiled_call(generation_config.compile_config)
+
+        is_prefill = True
+
+        # first we need to do top-k on the first token 
+        model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+        outputs = model_forward(**model_inputs, return_dict=True)
+        first_tokens = outputs.logits[:, -1].topk(k=10)[1]
+        top_continuation_embeddings = self.model.get_input_embeddings()(first_tokens)
+        embeded_sequences = [torch.cat([model_inputs['inputs_embeds'], c.unsqueeze(0).unsqueeze(1)], dim=1) for c in top_continuation_embeddings[0]]
+        model_kwargs['attention_mask'] = torch.cat([model_inputs['attention_mask'], torch.ones((1,1), device=input_ids.device)], dim=1)
+        base_model_kwargs = model_kwargs.copy()
+        outputs = []
+        advantages = []
+        for i in range(10):
+            model_kwargs = base_model_kwargs.copy()
+            model_kwargs['inputs_embeds'] = embeded_sequences[i]
+            sequence_done = False
+            current_input_ids = torch.clone(input_ids)
+            current_scores = ()
+            current_advantages = []
+            while not sequence_done:
+                model_inputs = self.prepare_inputs_for_generation(current_input_ids, **model_kwargs)
+                model_outputs = model_forward(**model_inputs, return_dict=True)
+                model_kwargs = self._update_model_kwargs_for_generation(
+                    model_outputs,
+                    model_kwargs,
+                    is_encoder_decoder=self.config.is_encoder_decoder,
+                )
+                next_token_logits = model_outputs.logits[:, -1, :].clone().float()
+                top_two_logits, _ = torch.softmax(next_token_logits, dim=-1).topk(k=2)
+                current_advantages.append((top_two_logits[0][0] - top_two_logits[0][1]).item())
+                next_token_logits = next_token_logits.to(input_ids.device)
+                next_token_scores = logits_processor(current_input_ids, next_token_logits)
+                next_token = torch.argmax(next_token_scores, dim=-1)
+                current_input_ids = torch.cat([current_input_ids, next_token[:, None]], dim=-1)
+                current_scores += (next_token_scores,)
+                sequence_done = next_token.item() == 2 or stopping_criteria(current_input_ids, current_scores)
+                del model_outputs
+            outputs.append(torch.cat([first_tokens[0][i].unsqueeze(0).unsqueeze(1), current_input_ids], dim=1))
+            advantages.append(current_advantages)
+        # while self._has_unfinished_sequences(
+        #     this_peer_finished, synced_gpus, device=input_ids.device, cur_len=cur_len, max_length=max_length
+        # ):
+        #     # prepare model inputs
+        #     model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+
+        #     # prepare variable output controls (note: some models won't accept all output controls)
+        #     model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
+        #     model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
+
+        #     if is_prefill:
+        #         outputs = self(**model_inputs, return_dict=True)
+        #         is_prefill = False
+        #     else:
+        #         outputs = model_forward(**model_inputs, return_dict=True)
+
+        #     # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
+        #     model_kwargs = self._update_model_kwargs_for_generation(
+        #         outputs,
+        #         model_kwargs,
+        #         is_encoder_decoder=self.config.is_encoder_decoder,
+        #     )
+        #     if synced_gpus and this_peer_finished:
+        #         continue
+
+        #     # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
+        #     # (the clone itself is always small)
+        #     next_token_logits = outputs.logits[:, -1, :].clone().float()
+        #     next_token_logits = next_token_logits.to(input_ids.device)
+
+        #     # pre-process distribution
+        #     next_token_scores = logits_processor(input_ids, next_token_logits)
+
+        #     # Store scores, attentions and hidden_states when required
+        #     if return_dict_in_generate:
+        #         if output_scores:
+        #             scores += (next_token_scores,)
+        #         if output_logits:
+        #             raw_logits += (next_token_logits,)
+        #         if output_attentions:
+        #             decoder_attentions += (
+        #                 (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+        #             )
+        #             if self.config.is_encoder_decoder:
+        #                 cross_attentions += (outputs.cross_attentions,)
+
+        #         if output_hidden_states:
+        #             decoder_hidden_states += (
+        #                 (outputs.decoder_hidden_states,)
+        #                 if self.config.is_encoder_decoder
+        #                 else (outputs.hidden_states,)
+        #             )
+
+        #     # token selection
+        #     if do_sample:
+        #         probs = nn.functional.softmax(next_token_scores, dim=-1)
+        #         # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
+        #         next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        #     else:
+        #         next_tokens = torch.argmax(next_token_scores, dim=-1)
+
+        #     # finished sentences should have their next token be a padding token
+        #     if has_eos_stopping_criteria:
+        #         next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+        #     # update generated ids, model inputs, and length for next step
+        #     input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+        #     if streamer is not None:
+        #         streamer.put(next_tokens.cpu())
+
+        #     unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
+        #     this_peer_finished = unfinished_sequences.max() == 0
+        #     cur_len += 1
+
+        #     # This is needed to properly delete outputs.logits which may be very large for first iteration
+        #     # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
+        #     del outputs
+
+        # if streamer is not None:
+        #     streamer.end()
+
+        if return_dict_in_generate:
+            if self.config.is_encoder_decoder:
+                return GenerateEncoderDecoderOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    logits=raw_logits,
+                    encoder_attentions=encoder_attentions,
+                    encoder_hidden_states=encoder_hidden_states,
+                    decoder_attentions=decoder_attentions,
+                    cross_attentions=cross_attentions,
+                    decoder_hidden_states=decoder_hidden_states,
+                    past_key_values=model_kwargs.get("past_key_values"),
+                )
+            else:
+                return GenerateDecoderOnlyOutput(
+                    sequences=outputs,
+                    scores=scores,
+                    logits=raw_logits,
+                    attentions=decoder_attentions,
+                    hidden_states=decoder_hidden_states,
+                    past_key_values=model_kwargs.get("past_key_values"),
+                    advantages=advantages,
+                )
+        else:
+            return outputs 
 
     def _sample(
         self,
