@@ -3231,22 +3231,24 @@ class GenerationMixin:
         is_prefill = True
 
         # first we need to do top-k on the first token 
+        num = 10
         model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
         outputs = model_forward(**model_inputs, return_dict=True)
-        first_tokens = outputs.logits[:, -1].topk(k=10)[1]
+        first_tokens = outputs.logits[:, -1].topk(k=num)[1]
+        first_advantages = torch.softmax(outputs.logits[:, -1], dim=-1).topk(k=num)[0][0] - torch.softmax(outputs.logits[:, -1], dim=-1).topk(k=num+1)[0][0][1:]
         top_continuation_embeddings = self.model.get_input_embeddings()(first_tokens)
         embeded_sequences = [torch.cat([model_inputs['inputs_embeds'], c.unsqueeze(0).unsqueeze(1)], dim=1) for c in top_continuation_embeddings[0]]
         model_kwargs['attention_mask'] = torch.cat([model_inputs['attention_mask'], torch.ones((1,1), device=input_ids.device)], dim=1)
         base_model_kwargs = model_kwargs.copy()
         outputs = []
         advantages = []
-        for i in range(10):
+        for i in range(num):
             model_kwargs = base_model_kwargs.copy()
             model_kwargs['inputs_embeds'] = embeded_sequences[i]
             sequence_done = False
             current_input_ids = torch.clone(input_ids)
             current_scores = ()
-            current_advantages = []
+            current_advantages = [first_advantages[i].item()]
             while not sequence_done:
                 model_inputs = self.prepare_inputs_for_generation(current_input_ids, **model_kwargs)
                 model_outputs = model_forward(**model_inputs, return_dict=True)
