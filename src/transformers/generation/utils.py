@@ -3241,8 +3241,11 @@ class GenerationMixin:
         embeded_sequences = [torch.cat([model_inputs['inputs_embeds'], c.unsqueeze(0).unsqueeze(1)], dim=1) for c in top_continuation_embeddings[0]]
         model_kwargs['attention_mask'] = torch.cat([model_inputs['attention_mask'], torch.ones((1,1), device=input_ids.device)], dim=1)
         base_model_kwargs = model_kwargs.copy()
-        attention_values = torch.concat(outputs.attentions, dim=0).cpu()
-        attentions = [[attention_values] for _ in range(num)]  # sequence, token, layer, batch (1), head, head_dim
+        if output_attentions:
+            attention_values = torch.concat(outputs.attentions, dim=0).cpu()
+            attentions = [[attention_values] for _ in range(num)]  # sequence, token, layer, batch (1), head, head_dim
+        else:
+            attentions = None
         outputs = []
         advantages = []
         for i in range(num):
@@ -3261,8 +3264,9 @@ class GenerationMixin:
                     model_kwargs,
                     is_encoder_decoder=self.config.is_encoder_decoder,
                 )
-                attention_values = torch.concat(model_outputs.attentions, dim=0).cpu()
-                attentions[i].append(attention_values)
+                if output_attentions:
+                    attention_values = torch.concat(model_outputs.attentions, dim=0).cpu()
+                    attentions[i].append(attention_values)
                 next_token_logits = model_outputs.logits[:, -1, :].clone().float()
                 top_two_logits, _ = torch.softmax(next_token_logits, dim=-1).topk(k=2)
                 current_advantages.append((top_two_logits[0][0] - top_two_logits[0][1]).item())
