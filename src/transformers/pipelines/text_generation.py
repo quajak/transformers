@@ -367,13 +367,22 @@ class TextGenerationPipeline(Pipeline):
         if "generation_config" not in generate_kwargs:
             generate_kwargs["generation_config"] = self.generation_config
 
-        generated_sequence = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
+        generation_output = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
+        if generate_kwargs.get("return_dict_in_generate", False):
+            generated_sequence = generation_output['sequences']
+        else:
+            generated_sequence = generation_output
+            
         out_b = generated_sequence.shape[0]
         if self.framework == "pt":
             generated_sequence = generated_sequence.reshape(in_b, out_b // in_b, *generated_sequence.shape[1:])
         elif self.framework == "tf":
             generated_sequence = tf.reshape(generated_sequence, (in_b, out_b // in_b, *generated_sequence.shape[1:]))
-        return {"generated_sequence": generated_sequence, "input_ids": input_ids, "prompt_text": prompt_text}
+        if generate_kwargs.get("output_logits", False):
+            logits = generation_output['logits']
+        else:
+            logits = None 
+        return {"generated_sequence": generated_sequence, "input_ids": input_ids, "prompt_text": prompt_text, "logits": logits}
 
     def postprocess(
         self,
@@ -433,4 +442,7 @@ class TextGenerationPipeline(Pipeline):
                 record = {"generated_text": all_text}
             records.append(record)
 
-        return records
+        if model_outputs.get("logits", None) is not None:
+            return records, model_outputs["logits"]
+        else:
+            return records
